@@ -1,0 +1,222 @@
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:logger/logger.dart';
+import '../../../core/state/auth_state.dart';
+import '../../../core/services/notification_service.dart';
+import '../../profile/providers/settings_provider.dart';
+import '../models/homework_model.dart';
+import '../services/homework_service.dart';
+import '../services/homework_storage.dart';
+
+final homeworkServiceProvider = Provider((ref) => HomeworkService());
+final homeworkStorageProvider = Provider((ref) => HomeworkStorage());
+
+/// 作业列表提供者
+final homeworkProvider = StateNotifierProvider<HomeworkNotifier, AsyncValue<List<HomeworkModel>>>((ref) {
+  return HomeworkNotifier(ref);
+});
+
+class HomeworkNotifier extends StateNotifier<AsyncValue<List<HomeworkModel>>> {
+  final Ref _ref;
+  final _logger = Logger();
+
+  HomeworkNotifier(this._ref) : super(const AsyncValue.loading()) {
+    _init();
+    
+    // 监听登录状态，如果登录成功则自动刷新
+    _ref.listen<AuthState>(authStateProvider, (previous, next) {
+      if (previous?.status != AuthStatus.authenticated && next.status == AuthStatus.authenticated) {
+        if (next.username != null) {
+          _logger.i('🔐 Login success detected, auto-refreshing homework...');
+          _silentRefresh(next.username!);
+        }
+      }
+    });
+  }
+
+  Future<void> _init() async {
+    final storage = _ref.read(homeworkStorageProvider);
+    final local = await storage.readHomeworkList();
+    
+    if (local.isNotEmpty) {
+      state = AsyncValue.data(local);
+      // 读完本地后，触发一次通知安排（补偿）
+      _scheduleReminders(local);
+    }
+
+    final auth = _ref.read(authStateProvider);
+    if (auth.status == AuthStatus.authenticated && auth.username != null) {
+      // 如果已登录，在读完本地后静默刷一下（无感）
+      _silentRefresh(auth.username!);
+    } else {
+      if (local.isEmpty) {
+        state = const AsyncValue.data([]);
+      }
+    }
+  }
+
+  /// 无感刷新
+  Future<void> _silentRefresh(String studentId) async {
+    try {
+      final manual = await _collectManualUnion();
+      final scraped = await _ref.read(homeworkServiceProvider).fetchHomeworkList(studentId);
+      
+      final merged = [...manual, ...scraped];
+      await _ref.read(homeworkStorageProvider).saveHomeworkList(merged);
+      state = AsyncValue.data(merged);
+      _scheduleReminders(merged);
+    } catch (e) {
+      _logger.w('⚠️ Silent refresh homework failed: $e');
+    }
+  }
+
+  /// 手动刷新 (显示 loading)
+  Future<void> refresh(String studentId) async {
+    try {
+      final manual = await _collectManualUnion();
+      
+      state = const AsyncValue.loading();
+      final scraped = await _ref.read(homeworkServiceProvider).fetchHomeworkList(studentId);
+      
+      final merged = [...manual, ...scraped];
+      await _ref.read(homeworkStorageProvider).saveHomeworkList(merged);
+      state = AsyncValue.data(merged);
+      _scheduleReminders(merged);
+    } catch (e, st) {
+      _logger.e('❌ Refresh homework failed: $e');
+      state = AsyncValue.error(e, st);
+    }
+  }
+
+  /// 退出登录时清除 (仅清除爬取的，保留手动的)
+  Future<void> clearAll() async {
+    final manual = await _collectManualUnion();
+    await _ref.read(homeworkStorageProvider).saveHomeworkList(manual);
+    state = AsyncValue.data(manual);
+    _rescheduleAll();
+  }
+
+  /// 添加手动作业
+  Future<void> addManualHomework({
+    required String title,
+    String courseName = '',
+    DateTime? endTime,
+    String remarks = '',
+  }) async {
+    final newItem = HomeworkModel(
+      id: 'manual_${DateTime.now().millisecondsSinceEpoch}',
+      title: title,
+      courseName: courseName,
+      endTime: endTime,
+      status: HomeworkStatus.pending,
+      studentId: 'manual',
+      isManual: true,
+      createdAt: DateTime.now(),
+      remarks: remarks,
+    );
+
+    final current = state.value ?? [];
+    final updated = [newItem, ...current];
+    await _ref.read(homeworkStorageProvider).saveHomeworkList(updated);
+    state = AsyncValue.data(updated);
+    _scheduleReminders(updated);
+  }
+
+  /// 删除作业
+  Future<void> deleteHomework(String id) async {
+    final current = state.value ?? [];
+    final updated = current.where((e) => e.id != id).toList();
+    await _ref.read(homeworkStorageProvider).saveHomeworkList(updated);
+    state = AsyncValue.data(updated);
+    // 取消幽灵闹钟：删除后重调度
+    _rescheduleAll();
+  }
+
+  /// 切换完成状态
+  Future<void> toggleStatus(String id) async {
+    final current = state.value ?? [];
+    final updated = current.map((e) {
+      if (e.id == id) {
+        final newStatus = e.status == HomeworkStatus.completed 
+            ? HomeworkStatus.pending 
+            : HomeworkStatus.completed;
+        return e.copyWith(status: newStatus);
+      }
+      return e;
+    }).toList();
+    await _ref.read(homeworkStorageProvider).saveHomeworkList(updated);
+    state = AsyncValue.data(updated);
+    _rescheduleAll();
+  }
+
+  /// 存档/撤销存档
+  Future<void> setArchived(String id, bool archived) async {
+    final current = state.value ?? [];
+    final updated = current.map((e) {
+      if (e.id == id) {
+        return e.copyWith(status: archived ? HomeworkStatus.archived : HomeworkStatus.pending);
+      }
+      return e;
+    }).toList();
+    await _ref.read(homeworkStorageProvider).saveHomeworkList(updated);
+    state = AsyncValue.data(updated);
+    _rescheduleAll();
+  }
+
+  /// 撤销删除 (恢复之前的状态)
+  Future<void> restoreList(List<HomeworkModel> oldList) async {
+    await _ref.read(homeworkStorageProvider).saveHomeworkList(oldList);
+    state = AsyncValue.data(oldList);
+    _rescheduleAll();
+  }
+
+  /// Agent/MCP 工具直接写 HomeworkStorage 后调用，
+  /// 把文件最新内容重新载入到内存 state，保证作业页立刻可见。
+  Future<void> reloadFromStorage() async {
+    try {
+      final list = await _ref.read(homeworkStorageProvider).readHomeworkList();
+      state = AsyncValue.data(list);
+      _scheduleReminders(list);
+    } catch (e) {
+      _logger.w('⚠️ Reload homework from storage failed: $e');
+    }
+  }
+
+  /// 合并内存 state 与文件中的手动作业（以文件为准 + 保留仅存在于内存的），
+  /// 避免 Agent 添加后被 refresh/_silentRefresh 用旧 state 覆盖丢失。
+  Future<List<HomeworkModel>> _collectManualUnion() async {
+    final fromState =
+        (state.value ?? []).where((e) => e.isManual).toList();
+    List<HomeworkModel> fromStorage = [];
+    try {
+      fromStorage = (await _ref
+              .read(homeworkStorageProvider)
+              .readHomeworkList())
+          .where((e) => e.isManual)
+          .toList();
+    } catch (_) {}
+    final storageIds = fromStorage.map((e) => e.id).toSet();
+    final stateOnly =
+        fromState.where((e) => !storageIds.contains(e.id)).toList();
+    return [...fromStorage, ...stateOnly];
+  }
+
+  void _rescheduleAll() {
+    // 统一走全局重调度，避免幽灵闹钟残留
+    try {
+      _ref.read(settingsProvider.notifier).rescheduleNotifications();
+    } catch (e) {
+      _logger.w('⚠️ reschedule after homework change failed: $e');
+      // 降级：至少重调度当前作业列表
+      _scheduleReminders(state.value ?? []);
+    }
+  }
+
+  void _scheduleReminders(List<HomeworkModel> list) {
+    if (list.isEmpty) return;
+    final settings = _ref.read(settingsProvider);
+    NotificationService().scheduleHomeworkReminders(
+      list,
+      settings.homeworkReminderHours,
+    );
+  }
+}
