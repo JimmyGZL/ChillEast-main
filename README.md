@@ -28,7 +28,7 @@
 一个尽可能好用点的湖南农大用的 App 。
 
 ### 目前已经使用原生 UI 实现的功能：
-- 课程表
+- 课程表（2026.9.30更新xls与ics导入，加入左侧下课时间）
 - 图书馆
 - 阳光服务（诉求反馈与进度查看）
 - 空教室查询
@@ -60,9 +60,9 @@
 
 | 首页 | 日程 | 课表 | 作业 |
 | :---: | :---: | :---: | :---: |
-| ![首页](img/screenshot/home_screen.png) | ![日程](img/screenshot/schedule.png) | ![课表](img/screenshot/timetable.png) | ![作业](img/screenshot/homework_list.png) |
-| **通知** | **功能** | **付款码** |
-| ![通知](img/screenshot/notification.png) | ![功能](img/screenshot/function_page.png) | ![付款码](img/screenshot/pay_code.png) |
+| ![首页](img/screenshot/home_screen.png) | ![日程](img/screenshot/schedule.png) | ![课表](img/screenshot/timetable.jpg) | ![作业](img/screenshot/homework_list.png) |
+| **通知** | **功能** | **付款码** | **课表导入** |
+| ![通知](img/screenshot/notification.png) | ![功能](img/screenshot/function_page.png) | ![付款码](img/screenshot/pay_code.png) | ![课表导入](img/screenshot/timetable2.jpg) |
 
 # TODO
 - [ ] 场馆预约的原生UI实现
